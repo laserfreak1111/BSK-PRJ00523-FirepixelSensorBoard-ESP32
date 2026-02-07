@@ -4,6 +4,7 @@
 
 #include <ETH.h>
 #include <WebServer.h>
+#include <FastLED.h>
 
 // ----------------------------------------------------
 // Ethernet-Konfiguration
@@ -13,19 +14,24 @@
 #define ETH_PHY_MDC   23
 #define ETH_PHY_MDIO  18
 #define ETH_PHY_POWER 12
-#define ETH_CLK_MODE  ETH_CLOCK_GPIO17_OUT  // 50 MHz aus ESP32 auf GPIO17
+#define ETH_CLK_MODE  ETH_CLOCK_GPIO17_OUT
 
 WebServer server(80);
-bool eth_connected = false;
+
+// ----------------------------------------------------
+// WS2815 Status-LEDs (FastLED)
+// ----------------------------------------------------
+#define LED_PIN     4
+#define LED_COUNT   2
+#define LED_TYPE    WS2812B      // WS2815 kompatibel
+#define COLOR_ORDER GRB
+#define LED_BRIGHTNESS  80
+
+CRGB statusLeds[LED_COUNT];
 
 // ----------------------------------------------------
 // Sensor- / Mux-Konfiguration
 // ----------------------------------------------------
-
-// Drei I2C-Muxer:
-//  0x70 → 8 Kanäle
-//  0x71 → 8 Kanäle
-//  0x72 → 4 Kanäle
 const uint8_t NUM_MUXES = 3;
 const uint8_t MUX_ADDR[NUM_MUXES]          = { 0x70, 0x71, 0x72 };
 const uint8_t MUX_CHANNEL_COUNT[NUM_MUXES] = { 8,    8,    4    };
@@ -33,51 +39,36 @@ const uint8_t MUX_CHANNEL_COUNT[NUM_MUXES] = { 8,    8,    4    };
 const uint8_t NUM_SENSORS_PER_CHANNEL = 3;
 const uint8_t SENSOR_ADDR[NUM_SENSORS_PER_CHANNEL] = { 0x44, 0x45, 0x46 };
 
-// Insgesamt 8 + 8 + 4 = 20 Zeilen
-#define TOTAL_ROWS 20
+#define TOTAL_ROWS 20   // 8 + 8 + 4
 
 opt3001 sensor;
-
-// Matrix für die aktuellen Lux-Werte
 float luxMatrix[TOTAL_ROWS][NUM_SENSORS_PER_CHANNEL];
 
 // ----------------------------------------------------
-// Terminal "clearen" durch Scrollen
+// I2C-Mux-Helfer
 // ----------------------------------------------------
-void clearTerminal() {
-  for (int i = 0; i < 40; i++) {
-    Serial.println();
-  }
-}
-
-// ----------------------------------------------------
-// I2C-Mux-Kanal auswählen / deaktivieren
-// ----------------------------------------------------
-void selectMuxChannel(uint8_t muxIndex, uint8_t channel) {
-  if (muxIndex >= NUM_MUXES) return;
-  if (channel >= MUX_CHANNEL_COUNT[muxIndex]) return;
-
-  Wire.beginTransmission(MUX_ADDR[muxIndex]);
-  Wire.write(1 << channel);   // genau ein Kanal aktiv
+void selectMuxChannel(uint8_t mux, uint8_t ch) {
+  if (mux >= NUM_MUXES) return;
+  if (ch >= MUX_CHANNEL_COUNT[mux]) return;
+  Wire.beginTransmission(MUX_ADDR[mux]);
+  Wire.write(1 << ch);
   Wire.endTransmission();
 }
 
-void disableAllMuxChannels(uint8_t muxIndex) {
-  if (muxIndex >= NUM_MUXES) return;
-
-  Wire.beginTransmission(MUX_ADDR[muxIndex]);
-  Wire.write(0x00);           // kein Kanal aktiv
+void disableMux(uint8_t mux) {
+  Wire.beginTransmission(MUX_ADDR[mux]);
+  Wire.write(0x00);
   Wire.endTransmission();
 }
 
 // ----------------------------------------------------
-// OPT3001 Reset auf Power-On-Default (0xC810)
+// OPT3001 Reset
 // ----------------------------------------------------
 void resetOpt3001(uint8_t addr) {
   Wire.beginTransmission(addr);
-  Wire.write(0x01);   // Config-Register
-  Wire.write(0xC8);   // MSB
-  Wire.write(0x10);   // LSB
+  Wire.write(0x01);
+  Wire.write(0xC8);
+  Wire.write(0x10);
   Wire.endTransmission();
   delay(5);
 }
@@ -86,245 +77,152 @@ void resetAllSensors() {
   for (uint8_t m = 0; m < NUM_MUXES; m++) {
     for (uint8_t ch = 0; ch < MUX_CHANNEL_COUNT[m]; ch++) {
       selectMuxChannel(m, ch);
-      delay(2);
       for (uint8_t i = 0; i < NUM_SENSORS_PER_CHANNEL; i++) {
         resetOpt3001(SENSOR_ADDR[i]);
       }
     }
-    disableAllMuxChannels(m);
+    disableMux(m);
   }
 }
 
 // ----------------------------------------------------
-// Ethernet-Event-Handler
+// Status-LEDs aktualisieren
 // ----------------------------------------------------
-void WiFiEvent(WiFiEvent_t event) {
-  switch (event) {
-    case SYSTEM_EVENT_ETH_START:
-      ETH.setHostname("esp32-lux-matrix");
-      Serial.println("ETH gestartet");
-      break;
-    case SYSTEM_EVENT_ETH_CONNECTED:
-      Serial.println("ETH verbunden");
-      break;
-    case SYSTEM_EVENT_ETH_GOT_IP:
-      eth_connected = true;
-      Serial.print("ETH IPv4: ");
-      Serial.println(ETH.localIP());
-      break;
-    case SYSTEM_EVENT_ETH_DISCONNECTED:
-      eth_connected = false;
-      Serial.println("ETH getrennt");
-      break;
-    case SYSTEM_EVENT_ETH_STOP:
-      eth_connected = false;
-      Serial.println("ETH gestoppt");
-      break;
-    default:
-      break;
-  }
-}
+void updateStatusLeds() {
+  bool anyAbove = false;
 
-// ----------------------------------------------------
-// HTTP-Handler: Root-Seite mit Live-Web-UI
-// ----------------------------------------------------
-void handleRoot() {
-  String html;
-  html.reserve(9000);
-
-  html += F(
-    "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<title>Lux-Matrix</title>"
-    "<style>"
-    "body{background:#111;color:#eee;font-family:Arial,sans-serif;text-align:center;margin:0;padding:0;}"
-    "h1{margin-top:20px;margin-bottom:5px;}"
-    "p{margin:4px;}"
-    "#info{font-size:12px;color:#aaa;}"
-    "svg{margin:20px auto;background:#222;border-radius:8px;display:block;}"
-    "circle{stroke:#444;stroke-width:1;}"
-    ".label{fill:#ccc;font-size:12px;}"
-    "</style>"
-    "</head><body>"
-    "<h1>Lux-Matrix</h1>"
-    "<p>Grün: &ge; 200 lx &nbsp;&nbsp; Schwarz: &lt; 200 lx</p>"
-    "<div id='info'>Verbunden zum ESP32 &ndash; Live-Update ohne Reload</div>"
-  );
-
-  const int cellSize = 40;
-  const int radius   = 14;
-  const int cols     = NUM_SENSORS_PER_CHANNEL; // 3
-  const int rows     = TOTAL_ROWS;              // 20
-  const int svgWidth  = cols * cellSize + 60;
-  const int svgHeight = rows * cellSize + 60;
-
-  html += "<svg id='luxSvg' width='" + String(svgWidth) + "' height='" + String(svgHeight) + "'>";
-
-  // Spalten-Labels (S1, S2, S3)
-  for (int c = 0; c < cols; c++) {
-    int cx = 40 + c * cellSize;
-    html += "<text class='label' x='" + String(cx) + "' y='20' text-anchor='middle'>S";
-    html += String(c + 1);
-    html += "</text>";
-  }
-
-  // Zeilen + Kreise mit IDs
-  for (int r = 0; r < rows; r++) {
-    int cy = 40 + r * cellSize;
-
-    // Zeilen-Label links
-    html += "<text class='label' x='10' y='" + String(cy + 4) + "'>";
-    html += String(r);
-    html += "</text>";
-
-    for (int c = 0; c < cols; c++) {
-      int cx = 40 + c * cellSize;
-
-      String id = "cell-" + String(r) + "-" + String(c);
-      html += "<circle id='" + id + "' cx='" + String(cx) +
-              "' cy='" + String(cy) + "' r='" + String(radius) +
-              "' fill='#000000'></circle>";
-    }
-  }
-
-  html += "</svg>";
-
-  // JavaScript für Live-Update (ohne STR-Makros)
-  html += F("<script>");
-  html += "const rows = " + String(TOTAL_ROWS) + ";\n";
-  html += "const cols = " + String(NUM_SENSORS_PER_CHANNEL) + ";\n";
-  html += F(
-    "function updateMatrix(){"
-      "fetch('/data').then(r=>r.json()).then(data=>{"
-        "for(let r=0;r<rows;r++){"
-          "for(let c=0;c<cols;c++){"
-            "let lux=data[r][c];"
-            "let id='cell-'+r+'-'+c;"
-            "let circle=document.getElementById(id);"
-            "if(!circle) continue;"
-            "let color='#000000';"
-            "if(lux!==null && lux>=200.0){color='#00ff00';}"
-            "circle.setAttribute('fill',color);"
-            "circle.setAttribute('title',lux!==null?lux.toFixed(1)+' lx':'ERR');"
-          "}"
-        "}"
-      "}).catch(e=>{console.log(e);});"
-    "}"
-    "setInterval(updateMatrix,500);"
-    "window.onload=updateMatrix;"
-    "</script>"
-    "</body></html>"
-  );
-
-  server.send(200, "text/html", html);
-}
-
-// ----------------------------------------------------
-// HTTP-Handler: /data → JSON der Lux-Matrix
-// ----------------------------------------------------
-void handleData() {
-  String json;
-  json.reserve(4000);
-  json += "[";
-
-  for (uint8_t r = 0; r < TOTAL_ROWS; r++) {
-    if (r > 0) json += ",";
-    json += "[";
-
+  for (uint8_t r = 0; r < TOTAL_ROWS && !anyAbove; r++) {
     for (uint8_t c = 0; c < NUM_SENSORS_PER_CHANNEL; c++) {
-      if (c > 0) json += ",";
       float v = luxMatrix[r][c];
-      if (isnan(v)) {
-        json += "null";
-      } else {
-        json += String(v, 1);
+      if (!isnan(v) && v >= 200.0f) {
+        anyAbove = true;
+        break;
       }
     }
-
-    json += "]";
   }
 
-  json += "]";
-  server.send(200, "application/json", json);
-}
+  CRGB color = anyAbove ? CRGB::Green : CRGB::Red;
 
-// ----------------------------------------------------
-// Serielle Tabellen-Ausgabe (zum Debuggen)
-// ----------------------------------------------------
-void printTableToSerial() {
-  clearTerminal();
-
-  Serial.println(" Zeile |   S1 (lx) |   S2 (lx) |   S3 (lx)");
-  Serial.println("-------+-----------+-----------+-----------");
-
-  for (uint8_t r = 0; r < TOTAL_ROWS; r++) {
-    Serial.printf(" %5u |", r);
-    for (uint8_t c = 0; c < NUM_SENSORS_PER_CHANNEL; c++) {
-      float lux = luxMatrix[r][c];
-      if (!isnan(lux)) {
-        Serial.printf(" %9.1f |", lux);
-      } else {
-        Serial.print("    ERR    |");
-      }
-    }
-    Serial.println();
+  for (uint8_t i = 0; i < LED_COUNT; i++) {
+    statusLeds[i] = color;
   }
-
-  Serial.println();
+  FastLED.show();
 }
 
 // ----------------------------------------------------
 // Sensorwerte aktualisieren
 // ----------------------------------------------------
 void updateLuxMatrix() {
-  uint8_t globalRow = 0;
+  uint8_t row = 0;
 
   for (uint8_t m = 0; m < NUM_MUXES; m++) {
     for (uint8_t ch = 0; ch < MUX_CHANNEL_COUNT[m]; ch++) {
-      if (globalRow >= TOTAL_ROWS) break;
+      if (row >= TOTAL_ROWS) break;
 
       selectMuxChannel(m, ch);
-      delay(2);
+      delayMicroseconds(500);
 
       for (uint8_t i = 0; i < NUM_SENSORS_PER_CHANNEL; i++) {
         float lux = NAN;
-
         if (sensor.setup(Wire, SENSOR_ADDR[i]) == 0) {
-          if (sensor.lux_read(&lux) != 0) {
-            lux = NAN;
-          }
+          if (sensor.lux_read(&lux) != 0) lux = NAN;
         }
-
-        luxMatrix[globalRow][i] = lux;
+        luxMatrix[row][i] = lux;
       }
-
-      globalRow++;
+      row++;
     }
-    disableAllMuxChannels(m);
+    disableMux(m);
   }
+
+  updateStatusLeds();
+}
+
+// ----------------------------------------------------
+// HTTP: JSON-Daten
+// ----------------------------------------------------
+void handleData() {
+  String json = "[";
+  for (uint8_t r = 0; r < TOTAL_ROWS; r++) {
+    if (r) json += ",";
+    json += "[";
+    for (uint8_t c = 0; c < NUM_SENSORS_PER_CHANNEL; c++) {
+      if (c) json += ",";
+      float v = luxMatrix[r][c];
+      json += isnan(v) ? "null" : String(v, 1);
+    }
+    json += "]";
+  }
+  json += "]";
+  server.send(200, "application/json", json);
+}
+
+// ----------------------------------------------------
+// HTTP: Web-UI
+// ----------------------------------------------------
+void handleRoot() {
+  String html;
+  html.reserve(8000);
+
+  html += F(
+    "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<style>"
+    "body{background:#111;color:#eee;font-family:Arial;text-align:center}"
+    "svg{background:#222;margin:20px auto;border-radius:8px;display:block}"
+    "circle{stroke:#444;stroke-width:1}"
+    ".lbl{fill:#ccc;font-size:12px}"
+    "</style></head><body>"
+    "<h2>Lux-Matrix (Live)</h2>"
+    "<p>≥200 lx = grün</p>"
+  );
+
+  const int cell = 40, r = 14;
+  html += "<svg width='180' height='860'>";
+
+  for (int y = 0; y < TOTAL_ROWS; y++) {
+    html += "<text class='lbl' x='5' y='" + String(40 + y * cell + 4) + "'>" + String(y) + "</text>";
+    for (int x = 0; x < 3; x++) {
+      String id = "c" + String(y) + "_" + String(x);
+      html += "<circle id='" + id + "' cx='" + String(40 + x * cell) +
+              "' cy='" + String(40 + y * cell) +
+              "' r='" + String(r) + "' fill='#000'/>";
+    }
+  }
+  html += "</svg>";
+
+  html += F(
+    "<script>"
+    "function upd(){fetch('/data').then(r=>r.json()).then(d=>{"
+    "for(let y=0;y<d.length;y++){"
+    "for(let x=0;x<d[y].length;x++){"
+    "let v=d[y][x];"
+    "let e=document.getElementById('c'+y+'_'+x);"
+    "e.setAttribute('fill',(v!==null&&v>=90)?'#0f0':'#000');"
+    "}}});}"
+    "setInterval(upd,250);upd();"
+    "</script></body></html>"
+  );
+
+  server.send(200, "text/html", html);
 }
 
 // ----------------------------------------------------
 // SETUP
 // ----------------------------------------------------
 void setup() {
-  Serial.begin(115200);
-  delay(1000);
-
-  // I2C starten (Pins ggf. anpassen)
   Wire.begin();
 
-  clearTerminal();
-  Serial.println("Start: OPT3001 Lux-Matrix mit Ethernet-Webserver (Live-UI)");
+  // FastLED init
+  FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(statusLeds, LED_COUNT);
+  FastLED.setBrightness(LED_BRIGHTNESS);
+  fill_solid(statusLeds, LED_COUNT, CRGB::Red);
+  FastLED.show();
 
-  // Sensoren zurücksetzen & konfigurieren
   resetAllSensors();
 
   for (uint8_t m = 0; m < NUM_MUXES; m++) {
     for (uint8_t ch = 0; ch < MUX_CHANNEL_COUNT[m]; ch++) {
       selectMuxChannel(m, ch);
-      delay(2);
-
       for (uint8_t i = 0; i < NUM_SENSORS_PER_CHANNEL; i++) {
         if (sensor.setup(Wire, SENSOR_ADDR[i]) == 0 &&
             sensor.detect() == 0) {
@@ -333,36 +231,26 @@ void setup() {
         }
       }
     }
-    disableAllMuxChannels(m);
+    disableMux(m);
   }
 
-  // Ethernet starten
-  WiFi.onEvent(WiFiEvent);
   ETH.begin(ETH_PHY_ADDR, ETH_PHY_POWER, ETH_PHY_MDC, ETH_PHY_MDIO,
             ETH_PHY_TYPE, ETH_CLK_MODE);
 
-  // Webserver-Routen
   server.on("/", handleRoot);
   server.on("/data", handleData);
   server.begin();
-  Serial.println("HTTP-Server gestartet (Port 80)");
 }
 
 // ----------------------------------------------------
 // LOOP
 // ----------------------------------------------------
 void loop() {
-  // Webserver bearbeiten
   server.handleClient();
 
-  // Sensoren regelmäßig aktualisieren
-  static unsigned long lastUpdate = 0;
-  const unsigned long updateIntervalMs = 200; // alle 200 ms
-
-  unsigned long now = millis();
-  if (now - lastUpdate >= updateIntervalMs) {
-    lastUpdate = now;
+  static uint32_t last = 0;
+  if (millis() - last > 100) {
+    last = millis();
     updateLuxMatrix();
-    printTableToSerial();   // wenn du keine serielle Ausgabe brauchst: auskommentieren
   }
 }
