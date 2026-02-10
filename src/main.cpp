@@ -21,11 +21,11 @@ WebServer server(80);
 // ----------------------------------------------------
 // WS2815 Status-LEDs (FastLED)
 // ----------------------------------------------------
-#define LED_PIN     4
-#define LED_COUNT   2
-#define LED_TYPE    WS2812B      // WS2815 kompatibel
-#define COLOR_ORDER GRB
-#define LED_BRIGHTNESS  80
+#define LED_PIN        4
+#define LED_COUNT      2
+#define LED_TYPE       WS2812B
+#define COLOR_ORDER    GRB
+#define LED_BRIGHTNESS 255
 
 CRGB statusLeds[LED_COUNT];
 
@@ -39,13 +39,13 @@ const uint8_t MUX_CHANNEL_COUNT[NUM_MUXES] = { 8,    8,    4    };
 const uint8_t NUM_SENSORS_PER_CHANNEL = 3;
 const uint8_t SENSOR_ADDR[NUM_SENSORS_PER_CHANNEL] = { 0x44, 0x45, 0x46 };
 
-#define TOTAL_ROWS 20   // 8 + 8 + 4
+#define TOTAL_ROWS 20
 
 opt3001 sensor;
 float luxMatrix[TOTAL_ROWS][NUM_SENSORS_PER_CHANNEL];
 
 // ----------------------------------------------------
-// I2C-Mux-Helfer
+// I2C-Mux Helfer
 // ----------------------------------------------------
 void selectMuxChannel(uint8_t mux, uint8_t ch) {
   if (mux >= NUM_MUXES) return;
@@ -86,7 +86,7 @@ void resetAllSensors() {
 }
 
 // ----------------------------------------------------
-// Status-LEDs aktualisieren
+// Status-LEDs (grün wenn irgendein Sensor >= 200 lx)
 // ----------------------------------------------------
 void updateStatusLeds() {
   bool anyAbove = false;
@@ -102,10 +102,7 @@ void updateStatusLeds() {
   }
 
   CRGB color = anyAbove ? CRGB::Green : CRGB::Red;
-
-  for (uint8_t i = 0; i < LED_COUNT; i++) {
-    statusLeds[i] = color;
-  }
+  fill_solid(statusLeds, LED_COUNT, color);
   FastLED.show();
 }
 
@@ -138,7 +135,7 @@ void updateLuxMatrix() {
 }
 
 // ----------------------------------------------------
-// HTTP: JSON-Daten
+// JSON-Daten
 // ----------------------------------------------------
 void handleData() {
   String json = "[";
@@ -157,26 +154,26 @@ void handleData() {
 }
 
 // ----------------------------------------------------
-// HTTP: Web-UI
+// WebUI – LOG-Skala: schwarz → grün → gelb → rot
 // ----------------------------------------------------
 void handleRoot() {
   String html;
-  html.reserve(8000);
+  html.reserve(9000);
 
   html += F(
     "<!DOCTYPE html><html><head><meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
     "<style>"
     "body{background:#111;color:#eee;font-family:Arial;text-align:center}"
-    "svg{background:#222;margin:20px auto;border-radius:8px;display:block}"
+    "svg{background:#222;margin:16px auto;border-radius:8px;display:block}"
     "circle{stroke:#444;stroke-width:1}"
-    ".lbl{fill:#ccc;font-size:12px}"
+    ".lbl{fill:#ccc;font-size:11px}"
     "</style></head><body>"
-    "<h2>Lux-Matrix (Live)</h2>"
-    "<p>≥200 lx = grün</p>"
+    "<h2>Lux-Matrix (logarithmisch)</h2>"
+    "<p>0 lx = schwarz → grün → gelb → rot</p>"
   );
 
-  const int cell = 40, r = 14;
+  const int cell = 40, rad = 14;
   html += "<svg width='180' height='860'>";
 
   for (int y = 0; y < TOTAL_ROWS; y++) {
@@ -185,21 +182,51 @@ void handleRoot() {
       String id = "c" + String(y) + "_" + String(x);
       html += "<circle id='" + id + "' cx='" + String(40 + x * cell) +
               "' cy='" + String(40 + y * cell) +
-              "' r='" + String(r) + "' fill='#000'/>";
+              "' r='" + String(rad) + "' fill='#000'/>";
     }
   }
   html += "</svg>";
 
+  // ---------- JavaScript ----------
   html += F(
     "<script>"
+    "function luxColor(v){"
+      "if(v===null||isNaN(v)||v<=0)return '#000000';"
+      "if(v>10000)v=10000;"
+      // logarithmische Normierung
+      "let t=Math.log10(v)/4.0;"   // 1..10000 → 0..1
+      "if(t<0)t=0;if(t>1)t=1;"
+      "let r,g,b;"
+      "if(t<0.33){"              // schwarz -> grün
+        "let u=t/0.33;"
+        "r=0;"
+        "g=Math.round(255*u);"
+        "b=0;"
+      "}else if(t<0.66){"        // grün -> gelb
+        "let u=(t-0.33)/0.33;"
+        "r=Math.round(255*u);"
+        "g=255;"
+        "b=0;"
+      "}else{"                   // gelb -> rot
+        "let u=(t-0.66)/0.34;"
+        "r=255;"
+        "g=Math.round(255*(1-u));"
+        "b=0;"
+      "}"
+      "return 'rgb('+r+','+g+','+b+')';"
+    "}"
     "function upd(){fetch('/data').then(r=>r.json()).then(d=>{"
-    "for(let y=0;y<d.length;y++){"
-    "for(let x=0;x<d[y].length;x++){"
-    "let v=d[y][x];"
-    "let e=document.getElementById('c'+y+'_'+x);"
-    "e.setAttribute('fill',(v!==null&&v>=90)?'#0f0':'#000');"
-    "}}});}"
-    "setInterval(upd,250);upd();"
+      "for(let y=0;y<d.length;y++){"
+        "for(let x=0;x<d[y].length;x++){"
+          "let v=d[y][x];"
+          "let e=document.getElementById('c'+y+'_'+x);"
+          "if(!e)continue;"
+          "e.setAttribute('fill',luxColor(v));"
+          "if(v!==null)e.setAttribute('title',v.toFixed(1)+' lx');"
+        "}"
+      "}"
+    "});}"
+    "setInterval(upd,300);upd();"
     "</script></body></html>"
   );
 
@@ -212,7 +239,6 @@ void handleRoot() {
 void setup() {
   Wire.begin();
 
-  // FastLED init
   FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(statusLeds, LED_COUNT);
   FastLED.setBrightness(LED_BRIGHTNESS);
   fill_solid(statusLeds, LED_COUNT, CRGB::Red);
