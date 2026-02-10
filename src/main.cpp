@@ -29,6 +29,11 @@ WebServer server(80);
 
 CRGB statusLeds[LED_COUNT];
 
+// LED-Zustand per GET steuerbar
+bool ledR = false;
+bool ledG = false;
+bool ledB = false;
+
 // ----------------------------------------------------
 // Sensor- / Mux-Konfiguration
 // ----------------------------------------------------
@@ -39,7 +44,7 @@ const uint8_t MUX_CHANNEL_COUNT[NUM_MUXES] = { 8,    8,    4    };
 const uint8_t NUM_SENSORS_PER_CHANNEL = 3;
 const uint8_t SENSOR_ADDR[NUM_SENSORS_PER_CHANNEL] = { 0x44, 0x45, 0x46 };
 
-#define TOTAL_ROWS 20
+#define TOTAL_ROWS 20   // 0 .. 19
 
 opt3001 sensor;
 float luxMatrix[TOTAL_ROWS][NUM_SENSORS_PER_CHANNEL];
@@ -56,6 +61,7 @@ void selectMuxChannel(uint8_t mux, uint8_t ch) {
 }
 
 void disableMux(uint8_t mux) {
+  if (mux >= NUM_MUXES) return;
   Wire.beginTransmission(MUX_ADDR[mux]);
   Wire.write(0x00);
   Wire.endTransmission();
@@ -86,23 +92,11 @@ void resetAllSensors() {
 }
 
 // ----------------------------------------------------
-// Status-LEDs (grün wenn irgendein Sensor >= 200 lx)
+// LEDs aus R/G/B-Flags setzen
 // ----------------------------------------------------
-void updateStatusLeds() {
-  bool anyAbove = false;
-
-  for (uint8_t r = 0; r < TOTAL_ROWS && !anyAbove; r++) {
-    for (uint8_t c = 0; c < NUM_SENSORS_PER_CHANNEL; c++) {
-      float v = luxMatrix[r][c];
-      if (!isnan(v) && v >= 200.0f) {
-        anyAbove = true;
-        break;
-      }
-    }
-  }
-
-  CRGB color = anyAbove ? CRGB::Green : CRGB::Red;
-  fill_solid(statusLeds, LED_COUNT, color);
+void applyLedColor() {
+  CRGB c(ledR ? 255 : 0, ledG ? 255 : 0, ledB ? 255 : 0);
+  for (uint8_t i = 0; i < LED_COUNT; i++) statusLeds[i] = c;
   FastLED.show();
 }
 
@@ -130,103 +124,174 @@ void updateLuxMatrix() {
     }
     disableMux(m);
   }
-
-  updateStatusLeds();
 }
 
 // ----------------------------------------------------
-// JSON-Daten
+// /data → flaches Array (0..59)
 // ----------------------------------------------------
 void handleData() {
   String json = "[";
+  bool first = true;
+
   for (uint8_t r = 0; r < TOTAL_ROWS; r++) {
-    if (r) json += ",";
-    json += "[";
     for (uint8_t c = 0; c < NUM_SENSORS_PER_CHANNEL; c++) {
-      if (c) json += ",";
+      if (!first) json += ",";
+      first = false;
       float v = luxMatrix[r][c];
       json += isnan(v) ? "null" : String(v, 1);
     }
-    json += "]";
   }
+
   json += "]";
   server.send(200, "application/json", json);
 }
 
 // ----------------------------------------------------
-// WebUI – LOG-Skala: schwarz → grün → gelb → rot
+// /led?r=1&g=0&b=1
+// ----------------------------------------------------
+bool parseBool(const String &s, bool cur) {
+  if (!s.length()) return cur;
+  String v = s; v.toLowerCase();
+  if (v == "1" || v == "true" || v == "on") return true;
+  if (v == "0" || v == "false" || v == "off") return false;
+  return cur;
+}
+
+void handleLed() {
+  if (server.hasArg("r")) ledR = parseBool(server.arg("r"), ledR);
+  if (server.hasArg("g")) ledG = parseBool(server.arg("g"), ledG);
+  if (server.hasArg("b")) ledB = parseBool(server.arg("b"), ledB);
+  applyLedColor();
+
+  server.send(200, "application/json",
+    "{\"r\":" + String(ledR?"true":"false") +
+    ",\"g\":" + String(ledG?"true":"false") +
+    ",\"b\":" + String(ledB?"true":"false") + "}"
+  );
+}
+
+// ----------------------------------------------------
+// WebUI – Grafik + Zahlen nebeneinander
+// Reihe 19 oben, 0 unten, LOGIC SIDE oben
 // ----------------------------------------------------
 void handleRoot() {
   String html;
-  html.reserve(9000);
+  html.reserve(12000);
+
+  const int cell = 40;
+  const int rad  = 14;
+  const int rows = TOTAL_ROWS;
+  const int cols = NUM_SENSORS_PER_CHANNEL;
+  const int topMargin = 70;
 
   html += F(
     "<!DOCTYPE html><html><head><meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
     "<style>"
-    "body{background:#111;color:#eee;font-family:Arial;text-align:center}"
-    "svg{background:#222;margin:16px auto;border-radius:8px;display:block}"
+    "body{background:#111;color:#eee;font-family:Arial,sans-serif;margin:0;padding:0;text-align:center}"
+    "h2{margin-top:12px;margin-bottom:4px}"
+    "p{margin:4px;font-size:13px}"
+    ".wrap{display:flex;justify-content:center;align-items:flex-start;gap:24px;margin:10px}"
+    "svg{background:#222;border-radius:8px}"
     "circle{stroke:#444;stroke-width:1}"
     ".lbl{fill:#ccc;font-size:11px}"
+    ".title{fill:#0f0;font-size:14px;font-weight:bold}"
+    "table{border-collapse:collapse;background:#222;border-radius:8px;overflow:hidden;font-size:12px}"
+    "th,td{border:1px solid #444;padding:2px 6px;text-align:right}"
+    "th{background:#333;font-weight:bold}"
+    "tr:nth-child(even){background:#262626}"
+    "tr:nth-child(odd){background:#1d1d1d}"
+    ".rowlabel{text-align:center;font-weight:bold;color:#aaa}"
     "</style></head><body>"
     "<h2>Lux-Matrix (logarithmisch)</h2>"
     "<p>0 lx = schwarz → grün → gelb → rot</p>"
   );
 
-  const int cell = 40, rad = 14;
-  html += "<svg width='180' height='860'>";
+  html += "<div class='wrap'>";
 
-  for (int y = 0; y < TOTAL_ROWS; y++) {
-    html += "<text class='lbl' x='5' y='" + String(40 + y * cell + 4) + "'>" + String(y) + "</text>";
-    for (int x = 0; x < 3; x++) {
-      String id = "c" + String(y) + "_" + String(x);
-      html += "<circle id='" + id + "' cx='" + String(40 + x * cell) +
-              "' cy='" + String(40 + y * cell) +
+  // --- Linke Seite: SVG-Grafik ---
+  html += "<svg width='200' height='900'>";
+
+  // LOGIC SIDE Label
+  html += "<text class='title' x='100' y='30' text-anchor='middle'>LOGIC SIDE</text>";
+
+  // Reihen 19..0 (oben nach unten)
+  for (int dispRow = 0; dispRow < rows; dispRow++) {
+    int logicalRow = rows - 1 - dispRow;   // 19..0
+    int cy = topMargin + dispRow * cell;
+
+    html += "<text class='lbl' x='15' y='" + String(cy + 4) + "'>" +
+            String(logicalRow) + "</text>";
+
+    for (int x = 0; x < cols; x++) {
+      String id = "c" + String(logicalRow) + "_" + String(x);
+      html += "<circle id='" + id +
+              "' cx='" + String(60 + x * cell) +
+              "' cy='" + String(cy) +
               "' r='" + String(rad) + "' fill='#000'/>";
     }
   }
+
   html += "</svg>";
 
-  // ---------- JavaScript ----------
+  // --- Rechte Seite: Wertetabelle ---
+  html += "<table><thead><tr>";
+  html += "<th>Row</th><th>S0</th><th>S1</th><th>S2</th>";
+  html += "</tr></thead><tbody>";
+
+  for (int dispRow = 0; dispRow < rows; dispRow++) {
+    int logicalRow = rows - 1 - dispRow;  // 19..0
+    html += "<tr>";
+    html += "<td class='rowlabel'>" + String(logicalRow) + "</td>";
+    for (int x = 0; x < cols; x++) {
+      String id = "v" + String(logicalRow) + "_" + String(x);
+      html += "<td id='" + id + "'>--.-</td>";
+    }
+    html += "</tr>";
+  }
+
+  html += "</tbody></table>";
+
+  html += "</div>"; // .wrap
+
+  // --- JavaScript: /data lesen, Grafik + Tabelle aktualisieren ---
   html += F(
     "<script>"
+    "const rows=20, cols=3;"
     "function luxColor(v){"
-      "if(v===null||isNaN(v)||v<=0)return '#000000';"
+      "if(v===null||isNaN(v)||v<=0)return '#000';"
       "if(v>10000)v=10000;"
-      // logarithmische Normierung
-      "let t=Math.log10(v)/4.0;"   // 1..10000 → 0..1
-      "if(t<0)t=0;if(t>1)t=1;"
-      "let r,g,b;"
-      "if(t<0.33){"              // schwarz -> grün
+      "let t=Math.log10(v)/4;"
+      "let r=0,g=0;"
+      "if(t<0.33){"
         "let u=t/0.33;"
-        "r=0;"
-        "g=Math.round(255*u);"
-        "b=0;"
-      "}else if(t<0.66){"        // grün -> gelb
+        "g=255*u;"
+      "}else if(t<0.66){"
         "let u=(t-0.33)/0.33;"
-        "r=Math.round(255*u);"
-        "g=255;"
-        "b=0;"
-      "}else{"                   // gelb -> rot
+        "r=255*u;g=255;"
+      "}else{"
         "let u=(t-0.66)/0.34;"
-        "r=255;"
-        "g=Math.round(255*(1-u));"
-        "b=0;"
+        "r=255;g=255*(1-u);"
       "}"
-      "return 'rgb('+r+','+g+','+b+')';"
+      "return `rgb(${r|0},${g|0},0)`;"
     "}"
-    "function upd(){fetch('/data').then(r=>r.json()).then(d=>{"
-      "for(let y=0;y<d.length;y++){"
-        "for(let x=0;x<d[y].length;x++){"
-          "let v=d[y][x];"
-          "let e=document.getElementById('c'+y+'_'+x);"
-          "if(!e)continue;"
-          "e.setAttribute('fill',luxColor(v));"
-          "if(v!==null)e.setAttribute('title',v.toFixed(1)+' lx');"
+    "function update(){"
+      "fetch('/data').then(r=>r.json()).then(a=>{"
+        "for(let row=0;row<rows;row++){"
+          "for(let col=0;col<cols;col++){"
+            "let idx=row*cols+col;"
+            "let v=a[idx];"
+            "let cid=`c${row}_${col}`;"
+            "let vid=`v${row}_${col}`;"
+            "let ce=document.getElementById(cid);"
+            "let ve=document.getElementById(vid);"
+            "if(ce)ce.setAttribute('fill',luxColor(v));"
+            "if(ve)ve.textContent=(v===null||isNaN(v))?'ERR':v.toFixed(1);"
+          "}"
         "}"
-      "}"
-    "});}"
-    "setInterval(upd,300);upd();"
+      "}).catch(e=>console.error(e));"
+    "}"
+    "setInterval(update,300);update();"
     "</script></body></html>"
   );
 
@@ -234,15 +299,14 @@ void handleRoot() {
 }
 
 // ----------------------------------------------------
-// SETUP
+// SETUP / LOOP
 // ----------------------------------------------------
 void setup() {
   Wire.begin();
 
   FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(statusLeds, LED_COUNT);
   FastLED.setBrightness(LED_BRIGHTNESS);
-  fill_solid(statusLeds, LED_COUNT, CRGB::Red);
-  FastLED.show();
+  applyLedColor();  // Start: alles aus
 
   resetAllSensors();
 
@@ -265,12 +329,10 @@ void setup() {
 
   server.on("/", handleRoot);
   server.on("/data", handleData);
+  server.on("/led", handleLed);
   server.begin();
 }
 
-// ----------------------------------------------------
-// LOOP
-// ----------------------------------------------------
 void loop() {
   server.handleClient();
 
