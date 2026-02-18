@@ -127,13 +127,15 @@ void updateLuxMatrix() {
 }
 
 // ----------------------------------------------------
-// /data → flaches Array (0..59)
+// /data → flaches Array UMGEKEHRT (Index 0 = oben)
 // ----------------------------------------------------
 void handleData() {
-  String json = "[";
+  String json;
+  json.reserve(4000);
+  json += "[";
   bool first = true;
 
-  for (uint8_t r = 0; r < TOTAL_ROWS; r++) {
+  for (int r = TOTAL_ROWS - 1; r >= 0; r--) {
     for (uint8_t c = 0; c < NUM_SENSORS_PER_CHANNEL; c++) {
       if (!first) json += ",";
       first = false;
@@ -164,19 +166,19 @@ void handleLed() {
   applyLedColor();
 
   server.send(200, "application/json",
-    "{\"r\":" + String(ledR?"true":"false") +
-    ",\"g\":" + String(ledG?"true":"false") +
-    ",\"b\":" + String(ledB?"true":"false") + "}"
+    "{\"r\":" + String(ledR ? "true" : "false") +
+    ",\"g\":" + String(ledG ? "true" : "false") +
+    ",\"b\":" + String(ledB ? "true" : "false") + "}"
   );
 }
 
 // ----------------------------------------------------
-// WebUI – Grafik + Zahlen nebeneinander
-// Reihe 19 oben, 0 unten, LOGIC SIDE oben
+// WebUI – Grafik + Werte nebeneinander
+// Mit Index-Zahlen 1..60 über jedem Kreis
 // ----------------------------------------------------
 void handleRoot() {
   String html;
-  html.reserve(12000);
+  html.reserve(17000);
 
   const int cell = 40;
   const int rad  = 14;
@@ -191,11 +193,12 @@ void handleRoot() {
     "body{background:#111;color:#eee;font-family:Arial,sans-serif;margin:0;padding:0;text-align:center}"
     "h2{margin-top:12px;margin-bottom:4px}"
     "p{margin:4px;font-size:13px}"
-    ".wrap{display:flex;justify-content:center;align-items:flex-start;gap:24px;margin:10px}"
+    ".wrap{display:flex;justify-content:center;align-items:flex-start;gap:24px;margin:10px;flex-wrap:wrap}"
     "svg{background:#222;border-radius:8px}"
     "circle{stroke:#444;stroke-width:1}"
     ".lbl{fill:#ccc;font-size:11px}"
     ".title{fill:#0f0;font-size:14px;font-weight:bold}"
+    ".idx{fill:#ddd;font-size:10px;font-weight:bold;text-anchor:middle;dominant-baseline:middle}"
     "table{border-collapse:collapse;background:#222;border-radius:8px;overflow:hidden;font-size:12px}"
     "th,td{border:1px solid #444;padding:2px 6px;text-align:right}"
     "th{background:#333;font-weight:bold}"
@@ -205,36 +208,45 @@ void handleRoot() {
     "</style></head><body>"
     "<h2>Lux-Matrix (logarithmisch)</h2>"
     "<p>0 lx = schwarz → grün → gelb → rot</p>"
+    "<p>/data: flaches Array (60) – Index 0 = oberste Reihe im GUI</p>"
   );
 
   html += "<div class='wrap'>";
 
-  // --- Linke Seite: SVG-Grafik ---
-  html += "<svg width='200' height='900'>";
+  // --- SVG ---
+  html += "<svg width='240' height='900'>";
+  html += "<text class='title' x='120' y='30' text-anchor='middle'>LOGIC SIDE</text>";
 
-  // LOGIC SIDE Label
-  html += "<text class='title' x='100' y='30' text-anchor='middle'>LOGIC SIDE</text>";
-
-  // Reihen 19..0 (oben nach unten)
+  // Anzeige-Reihen (oben->unten): Row 19..0
+  // Datenindex im flachen Array: dispRow*3 + col   (dispRow=0 ist oben)
+  // Index-Label: +1 für 1..60
   for (int dispRow = 0; dispRow < rows; dispRow++) {
-    int logicalRow = rows - 1 - dispRow;   // 19..0
+    int logicalRow = rows - 1 - dispRow;  // 19..0
     int cy = topMargin + dispRow * cell;
 
-    html += "<text class='lbl' x='15' y='" + String(cy + 4) + "'>" +
-            String(logicalRow) + "</text>";
+    // Row-Label links
+    html += "<text class='lbl' x='15' y='" + String(cy + 4) + "'>" + String(logicalRow) + "</text>";
 
-    for (int x = 0; x < cols; x++) {
-      String id = "c" + String(logicalRow) + "_" + String(x);
-      html += "<circle id='" + id +
-              "' cx='" + String(60 + x * cell) +
+    for (int col = 0; col < cols; col++) {
+      int cx = 70 + col * cell;
+
+      // Kreis-ID bleibt logisch (Row/Col), damit JS einfach bleibt
+      String cid = "c" + String(logicalRow) + "_" + String(col);
+      html += "<circle id='" + cid +
+              "' cx='" + String(cx) +
               "' cy='" + String(cy) +
               "' r='" + String(rad) + "' fill='#000'/>";
+
+      // Index-Zahl 1..60 (statisch)
+      int idxLabel = dispRow * cols + col + 1; // 1..60 von oben nach unten
+      html += "<text class='idx' x='" + String(cx) + "' y='" + String(cy - 22) + "'>";
+      html += String(idxLabel);
+      html += "</text>";
     }
   }
-
   html += "</svg>";
 
-  // --- Rechte Seite: Wertetabelle ---
+  // --- Tabelle ---
   html += "<table><thead><tr>";
   html += "<th>Row</th><th>S0</th><th>S1</th><th>S2</th>";
   html += "</tr></thead><tbody>";
@@ -243,18 +255,17 @@ void handleRoot() {
     int logicalRow = rows - 1 - dispRow;  // 19..0
     html += "<tr>";
     html += "<td class='rowlabel'>" + String(logicalRow) + "</td>";
-    for (int x = 0; x < cols; x++) {
-      String id = "v" + String(logicalRow) + "_" + String(x);
+    for (int col = 0; col < cols; col++) {
+      String id = "v" + String(logicalRow) + "_" + String(col);
       html += "<td id='" + id + "'>--.-</td>";
     }
     html += "</tr>";
   }
-
   html += "</tbody></table>";
 
-  html += "</div>"; // .wrap
+  html += "</div>"; // wrap
 
-  // --- JavaScript: /data lesen, Grafik + Tabelle aktualisieren ---
+  // --- JS: /data lesen und aktualisieren ---
   html += F(
     "<script>"
     "const rows=20, cols=3;"
@@ -277,14 +288,13 @@ void handleRoot() {
     "}"
     "function update(){"
       "fetch('/data').then(r=>r.json()).then(a=>{"
-        "for(let row=0;row<rows;row++){"
+        "for(let dispRow=0;dispRow<rows;dispRow++){"
+          "let logicalRow=(rows-1)-dispRow;"   // 19..0"
           "for(let col=0;col<cols;col++){"
-            "let idx=row*cols+col;"
+            "let idx=dispRow*cols+col;"
             "let v=a[idx];"
-            "let cid=`c${row}_${col}`;"
-            "let vid=`v${row}_${col}`;"
-            "let ce=document.getElementById(cid);"
-            "let ve=document.getElementById(vid);"
+            "let ce=document.getElementById(`c${logicalRow}_${col}`);"
+            "let ve=document.getElementById(`v${logicalRow}_${col}`);"
             "if(ce)ce.setAttribute('fill',luxColor(v));"
             "if(ve)ve.textContent=(v===null||isNaN(v))?'ERR':v.toFixed(1);"
           "}"
@@ -310,6 +320,7 @@ void setup() {
 
   resetAllSensors();
 
+  // Sensoren konfigurieren (Continuous Mode)
   for (uint8_t m = 0; m < NUM_MUXES; m++) {
     for (uint8_t ch = 0; ch < MUX_CHANNEL_COUNT[m]; ch++) {
       selectMuxChannel(m, ch);
